@@ -34,6 +34,9 @@ from backend.utils import (
     format_non_streaming_response,
     convert_to_pf_format,
     format_pf_non_streaming_response,
+    uses_max_completion_tokens,
+    get_model_api_config,
+    format_request_for_model,
 )
 
 bp = Blueprint("routes", __name__, static_folder="static", template_folder="static")
@@ -115,12 +118,17 @@ azure_openai_tools = []
 azure_openai_available_tools = []
 
 # Initialize Azure OpenAI Client
-async def init_openai_client():
+async def init_openai_client(api_version: str = None):
     azure_openai_client = None
     
     try:
-        # API version check
+        # Use provided API version or default to legacy version
+        if api_version is None:
+            api_version = app_settings.azure_openai.preview_api_version
+            
+        # API version check (only for legacy API versions)
         if (
+            api_version == app_settings.azure_openai.preview_api_version and
             app_settings.azure_openai.preview_api_version
             < MINIMUM_SUPPORTED_AZURE_OPENAI_PREVIEW_API_VERSION
         ):
@@ -177,7 +185,7 @@ async def init_openai_client():
 
         
         azure_openai_client = AsyncAzureOpenAI(
-            api_version=app_settings.azure_openai.preview_api_version,
+            api_version=api_version,
             api_key=aoai_api_key,
             azure_ad_token_provider=ad_token_provider,
             default_headers=default_headers,
@@ -284,12 +292,22 @@ def prepare_model_args(request_body, request_headers):
     model_args = {
         "messages": messages,
         "temperature": app_settings.azure_openai.temperature,
-        "max_tokens": app_settings.azure_openai.max_tokens,
         "top_p": app_settings.azure_openai.top_p,
         "stop": app_settings.azure_openai.stop_sequence,
         "stream": app_settings.azure_openai.stream,
         "model": app_settings.azure_openai.model
     }
+    
+    # Use appropriate token limit parameter based on model
+    if uses_max_completion_tokens(app_settings.azure_openai.model):
+        # Use max_completion_tokens for GPT-5 and o1 series models
+        if app_settings.azure_openai.max_completion_tokens is not None:
+            model_args["max_completion_tokens"] = app_settings.azure_openai.max_completion_tokens
+        else:
+            model_args["max_completion_tokens"] = app_settings.azure_openai.max_tokens
+    else:
+        # Use max_tokens for older models
+        model_args["max_tokens"] = app_settings.azure_openai.max_tokens
 
     if len(messages) > 0:
         if messages[-1]["role"] == "user":
@@ -418,6 +436,233 @@ async def process_function_call(response):
     
     return None
 
+async def make_responses_api_request(model_args, api_version):
+    """
+    Make a direct HTTP request to the GPT-5 Responses API.
+    
+    This bypasses the OpenAI client library which doesn't support the Responses API format.
+    """
+    # Build endpoint URL
+    if app_settings.azure_openai.endpoint:
+        # Check if endpoint already contains the responses path
+        endpoint = app_settings.azure_openai.endpoint.rstrip('/')
+        if '/openai/responses' in endpoint:
+            # Endpoint already contains full path, use as-is but update API version if needed
+            if f'api-version={api_version}' not in endpoint:
+                # Replace or add API version
+                if 'api-version=' in endpoint:
+                    # Replace existing API version
+                    import re
+                    url = re.sub(r'api-version=[^&]*', f'api-version={api_version}', endpoint)
+                else:
+                    # Add API version
+                    separator = '&' if '?' in endpoint else '?'
+                    url = f"{endpoint}{separator}api-version={api_version}"
+            else:
+                url = endpoint
+        else:
+            # Traditional endpoint, add responses path
+            url = f"{endpoint}/openai/responses?api-version={api_version}"
+    else:
+        # Build from resource name
+        base_url = f"https://{app_settings.azure_openai.resource}.openai.azure.com"
+        url = f"{base_url}/openai/responses?api-version={api_version}"
+    
+    logging.debug(f"GPT-5 Responses API URL: {url}")
+    logging.debug(f"GPT-5 Request Body: {json.dumps(model_args, indent=2)}")
+    
+    # Prepare headers
+    headers = {
+        'Content-Type': 'application/json',
+        'User-Agent': USER_AGENT
+    }
+    
+    # Add authentication
+    if app_settings.azure_openai.key:
+        headers['api-key'] = app_settings.azure_openai.key
+    else:
+        # Use Azure Entra ID authentication
+        async with DefaultAzureCredential() as credential:
+            token_provider = get_bearer_token_provider(
+                credential, 
+                "https://cognitiveservices.azure.com/.default"
+            )
+            token = await token_provider()
+            headers['Authorization'] = f'Bearer {token}'
+    
+    # Add security context if enabled (mimic the traditional client approach)
+    if MS_DEFENDER_ENABLED:
+        authenticated_user_details = get_authenticated_user_details({})
+        application_name = app_settings.ui.title
+        user_security_context = get_msdefender_user_json(authenticated_user_details, {}, application_name)
+        # Use the same serialization method as the traditional client
+        if user_security_context and hasattr(user_security_context, 'to_dict'):
+            model_args['user_security_context'] = user_security_context.to_dict()
+        elif user_security_context:
+            model_args['user_security_context'] = user_security_context
+    
+    # Make the request
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+        response = await client.post(url, json=model_args, headers=headers)
+        
+        # For streaming responses, return the response directly in a format compatible with existing streaming logic
+        content_type = response.headers.get('content-type', '')
+        if 'text/event-stream' in content_type and model_args.get('stream', False):
+            # Create a streaming response object that mimics OpenAI's streaming response
+            class MockStreamingResponse:
+                def __init__(self, response):
+                    self.response = response
+                    self.headers = response.headers
+                    
+                def parse(self):
+                    # Return self to support async iteration
+                    return self
+                    
+                def __aiter__(self):
+                    return self._stream_events()
+                    
+                async def _stream_events(self):
+                    """Convert GPT-5 Responses API streaming format to OpenAI Chat Completions format"""
+                    async for line in self.response.aiter_lines():
+                        if line.startswith('data: '):
+                            data_str = line[6:]  # Remove 'data: ' prefix
+                            if data_str == '[DONE]':
+                                break
+                            try:
+                                event_data = json.loads(data_str)
+                                
+                                # Convert Responses API event to Chat Completions format
+                                # GPT-5 Responses API may have different event structure
+                                if 'delta' in event_data:
+                                    # Already in delta format
+                                    chat_chunk = {
+                                        'id': event_data.get('id', ''),
+                                        'object': 'chat.completion.chunk',
+                                        'created': event_data.get('created', 0),
+                                        'model': event_data.get('model', ''),
+                                        'choices': [{
+                                            'index': 0,
+                                            'delta': event_data['delta'],
+                                            'finish_reason': event_data.get('finish_reason')
+                                        }]
+                                    }
+                                elif 'content' in event_data:
+                                    # Convert content to delta format
+                                    chat_chunk = {
+                                        'id': event_data.get('id', ''),
+                                        'object': 'chat.completion.chunk', 
+                                        'created': event_data.get('created', 0),
+                                        'model': event_data.get('model', ''),
+                                        'choices': [{
+                                            'index': 0,
+                                            'delta': {'content': event_data['content']},
+                                            'finish_reason': event_data.get('finish_reason')
+                                        }]
+                                    }
+                                else:
+                                    # Unknown format, pass through
+                                    chat_chunk = event_data
+                                
+                                # Create mock chunk object
+                                class MockChunk:
+                                    def __init__(self, data):
+                                        self.choices = []
+                                        if 'choices' in data and data['choices']:
+                                            choice_data = data['choices'][0]
+                                            choice = type('Choice', (), {})()
+                                            
+                                            # Create delta object with proper attributes
+                                            delta_data = choice_data.get('delta', {})
+                                            delta = type('Delta', (), {})()
+                                            # Set default attributes that might be expected
+                                            delta.role = None
+                                            delta.content = None
+                                            delta.tool_calls = None
+                                            
+                                            if isinstance(delta_data, dict):
+                                                for key, value in delta_data.items():
+                                                    setattr(delta, key, value)
+                                            elif isinstance(delta_data, str):
+                                                # Handle case where delta is just a content string
+                                                delta.content = delta_data
+                                            choice.delta = delta
+                                            
+                                            choice.finish_reason = choice_data.get('finish_reason')
+                                            choice.index = choice_data.get('index', 0)
+                                            self.choices.append(choice)
+                                        self.id = data.get('id', '')
+                                        self.model = data.get('model', '')
+                                        self.object = data.get('object', 'chat.completion.chunk')
+                                        self.created = data.get('created', 0)
+                                
+                                yield MockChunk(chat_chunk)
+                                
+                            except json.JSONDecodeError:
+                                # Skip malformed JSON
+                                continue
+                
+            return MockStreamingResponse(response)
+        
+        # Create a mock raw_response object that mimics OpenAI's response structure for non-streaming
+        class MockRawResponse:
+            def __init__(self, response):
+                self.response = response
+                self.headers = response.headers
+                
+            def parse(self):
+                response_data = self.response.json()
+                
+                # Convert Responses API format to Chat Completions format
+                # The Responses API may have a different structure, so we adapt it
+                if 'choices' not in response_data and 'content' in response_data:
+                    # Convert single response to choices format
+                    adapted_data = {
+                        'choices': [{
+                            'message': {
+                                'content': response_data.get('content', ''),
+                                'role': 'assistant'
+                            },
+                            'finish_reason': 'stop'
+                        }],
+                        'id': response_data.get('id', ''),
+                        'object': 'chat.completion',
+                        'created': response_data.get('created', 0),
+                        'model': response_data.get('model', ''),
+                        'usage': response_data.get('usage', {})
+                    }
+                    response_data = adapted_data
+                
+                # Create a response object with the expected attributes
+                class MockChatResponse:
+                    def __init__(self, data):
+                        self.choices = []
+                        if 'choices' in data:
+                            for choice_data in data['choices']:
+                                choice = type('Choice', (), {
+                                    'message': type('Message', (), choice_data.get('message', {})),
+                                    'finish_reason': choice_data.get('finish_reason', 'stop')
+                                })()
+                                self.choices.append(choice)
+                        self.id = data.get('id', '')
+                        self.object = data.get('object', 'chat.completion')
+                        self.created = data.get('created', 0)
+                        self.model = data.get('model', '')
+                        self.usage = data.get('usage', {})
+                
+                return MockChatResponse(response_data)
+        
+        if response.status_code != 200:
+            # Log the error response details
+            try:
+                error_details = response.json()
+                logging.error(f"GPT-5 API Error Response: {error_details}")
+            except:
+                logging.error(f"GPT-5 API Error (status {response.status_code}): {response.text}")
+            response.raise_for_status()
+            
+        return MockRawResponse(response)
+
+
 async def send_chat_request(request_body, request_headers):
     filtered_messages = []
     messages = request_body.get("messages", [])
@@ -429,8 +674,20 @@ async def send_chat_request(request_body, request_headers):
     model_args = prepare_model_args(request_body, request_headers)
 
     try:
-        azure_openai_client = await init_openai_client()
-        raw_response = await azure_openai_client.chat.completions.with_raw_response.create(**model_args)
+        # Get model configuration to determine API version
+        model_config = get_model_api_config(app_settings.azure_openai.model)
+        api_version = model_config.api_version
+        
+        # Format request parameters based on model requirements
+        formatted_model_args = format_request_for_model(model_args, app_settings.azure_openai.model)
+        
+        # For GPT-5 models, make direct HTTP request to Responses API
+        if model_config.uses_responses_endpoint:
+            raw_response = await make_responses_api_request(formatted_model_args, api_version)
+        else:
+            # Use traditional client for other models
+            azure_openai_client = await init_openai_client(api_version)
+            raw_response = await azure_openai_client.chat.completions.with_raw_response.create(**formatted_model_args)
         response = raw_response.parse()
         apim_request_id = raw_response.headers.get("apim-request-id") 
     except Exception as e:
@@ -1048,10 +1305,35 @@ async def generate_title(conversation_messages) -> str:
     messages.append({"role": "user", "content": title_prompt})
 
     try:
-        azure_openai_client = await init_openai_client()
-        response = await azure_openai_client.chat.completions.create(
-            model=app_settings.azure_openai.model, messages=messages, temperature=1, max_tokens=64
-        )
+        # Get model configuration to determine API version
+        model_config = get_model_api_config(app_settings.azure_openai.model)
+        api_version = model_config.api_version
+        
+        azure_openai_client = await init_openai_client(api_version)
+        
+        # Build request args with appropriate token parameter
+        request_args = {
+            "model": app_settings.azure_openai.model,
+            "messages": messages,
+            "temperature": 1
+        }
+        
+        # Use appropriate token limit parameter based on model
+        if uses_max_completion_tokens(app_settings.azure_openai.model):
+            request_args["max_completion_tokens"] = 64
+        else:
+            request_args["max_tokens"] = 64
+        
+        # Format request parameters based on model requirements
+        formatted_request_args = format_request_for_model(request_args, app_settings.azure_openai.model)
+        
+        # For GPT-5 models, make direct HTTP request to Responses API
+        if model_config.uses_responses_endpoint:
+            raw_response = await make_responses_api_request(formatted_request_args, api_version)
+            response = raw_response.parse()
+        else:
+            # Use traditional client for other models
+            response = await azure_openai_client.chat.completions.create(**formatted_request_args)
 
         title = response.choices[0].message.content
         return title

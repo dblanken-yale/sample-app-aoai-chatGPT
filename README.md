@@ -146,7 +146,9 @@ Note: RBAC assignments can take a few minutes before becoming effective.
     |AZURE_OPENAI_KEY|Optional if using Microsoft Entra ID -- see our documentation on the required resource setup for identity-based authentication.||One of the API keys of your Azure OpenAI resource|
     |AZURE_OPENAI_TEMPERATURE|No|0|What sampling temperature to use, between 0 and 2. Higher values like 0.8 will make the output more random, while lower values like 0.2 will make it more focused and deterministic. A value of 0 is recommended when using your data.|
     |AZURE_OPENAI_TOP_P|No|1.0|An alternative to sampling with temperature, called nucleus sampling, where the model considers the results of the tokens with top_p probability mass. We recommend setting this to 1.0 when using your data.|
-    |AZURE_OPENAI_MAX_TOKENS|No|1000|The maximum number of tokens allowed for the generated answer.|
+    |AZURE_OPENAI_MAX_TOKENS|No|1000|The maximum number of tokens allowed for the generated answer. Used for older models (GPT-4, GPT-3.5, etc.).|
+    |AZURE_OPENAI_MAX_COMPLETION_TOKENS|No||The maximum number of completion tokens allowed for the generated answer. Used for newer models (GPT-5, o1 series). If not set, falls back to AZURE_OPENAI_MAX_TOKENS value.|
+    |AZURE_OPENAI_GPT5_API_VERSION|No|2025-04-01-preview|API version to use for GPT-5 models. Automatically selected based on model type.|
     |AZURE_OPENAI_STOP_SEQUENCE|No||Up to 4 sequences where the API will stop generating further tokens. Represent these as a string joined with "|", e.g. `"stop1|stop2|stop3"`|
     |AZURE_OPENAI_SYSTEM_MESSAGE|No|You are an AI assistant that helps people find information.|A brief description of the role and tone the model should use|
     |AZURE_OPENAI_STREAM|No|True|Whether or not to use streaming for the response. Note: Setting this to true prevents the use of prompt flow.|

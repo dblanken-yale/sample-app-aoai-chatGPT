@@ -4,7 +4,7 @@ import logging
 import requests
 import dataclasses
 
-from typing import List
+from typing import List, NamedTuple
 
 DEBUG = os.environ.get("DEBUG", "false")
 if DEBUG.lower() == "true":
@@ -229,4 +229,110 @@ def comma_separated_string_to_list(s: str) -> List[str]:
     Split comma-separated values into a list.
     '''
     return s.strip().replace(' ', '').split(',')
+
+
+class ModelApiConfig(NamedTuple):
+    """Configuration for different model API patterns"""
+    uses_max_completion_tokens: bool
+    uses_responses_endpoint: bool  # True for /responses, False for /deployments/{model}/chat/completions
+    api_version: str
+    
+
+def get_model_api_config(model_name: str) -> ModelApiConfig:
+    """
+    Get the complete API configuration for a model.
+    
+    Args:
+        model_name: The model name/deployment name
+    
+    Returns:
+        ModelApiConfig with endpoint pattern, API version, and token parameter info
+    """
+    model_lower = model_name.lower()
+    
+    # GPT-5 series models use different endpoint and API version
+    if any(pattern in model_lower for pattern in ['gpt-5', 'gpt5']):
+        return ModelApiConfig(
+            uses_max_completion_tokens=True,
+            uses_responses_endpoint=True,
+            api_version="2025-04-01-preview"
+        )
+    
+    # o1 series models use max_completion_tokens but traditional endpoint
+    if model_lower.startswith('o1') or 'o1-' in model_lower:
+        return ModelApiConfig(
+            uses_max_completion_tokens=True,
+            uses_responses_endpoint=False,
+            api_version="2024-05-01-preview"
+        )
+        
+    # Default configuration for older models (GPT-4, GPT-3.5, etc.)
+    return ModelApiConfig(
+        uses_max_completion_tokens=False,
+        uses_responses_endpoint=False,
+        api_version="2024-05-01-preview"
+    )
+
+
+def uses_max_completion_tokens(model_name: str) -> bool:
+    """
+    Determine if a model uses max_completion_tokens instead of max_tokens.
+    
+    Args:
+        model_name: The model name/deployment name
+    
+    Returns:
+        True if model uses max_completion_tokens, False if it uses max_tokens
+    """
+    return get_model_api_config(model_name).uses_max_completion_tokens
+
+
+def format_request_for_model(model_args: dict, model_name: str) -> dict:
+    """
+    Format request parameters based on the model's API requirements.
+    
+    GPT-5 models use the Responses API which requires different parameter names:
+    - 'messages' becomes 'input'
+    - Other parameters remain the same
+    
+    Args:
+        model_args: Original request arguments
+        model_name: The model name
+        
+    Returns:
+        Formatted request arguments for the specific model
+    """
+    config = get_model_api_config(model_name)
+    
+    # For GPT-5 models using Responses API
+    if config.uses_responses_endpoint:
+        formatted_args = model_args.copy()
+        
+        # Transform 'messages' to 'input' for Responses API
+        if 'messages' in formatted_args:
+            messages = formatted_args.pop('messages')
+            formatted_args['input'] = messages
+        
+        # Transform 'max_completion_tokens' to 'max_output_tokens' for Responses API
+        if 'max_completion_tokens' in formatted_args:
+            max_tokens = formatted_args.pop('max_completion_tokens')
+            formatted_args['max_output_tokens'] = max_tokens
+        
+        # Handle extra_body parameter (move contents to top level for Responses API)
+        if 'extra_body' in formatted_args:
+            extra_body = formatted_args.pop('extra_body')
+            # Move security context to top level if present
+            if isinstance(extra_body, dict) and 'user_security_context' in extra_body:
+                formatted_args['user_security_context'] = extra_body['user_security_context']
+        
+        # Remove parameters not supported by Responses API
+        unsupported_params = ['stop', 'temperature', 'top_p']  # GPT-5 doesn't support these parameters
+        for param in unsupported_params:
+            if param in formatted_args:
+                formatted_args.pop(param)
+                
+        return formatted_args
+    
+    # For traditional models, return unchanged
+    return model_args
 
