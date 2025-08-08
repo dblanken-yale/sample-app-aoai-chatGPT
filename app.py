@@ -468,8 +468,6 @@ async def make_responses_api_request(model_args, api_version):
         base_url = f"https://{app_settings.azure_openai.resource}.openai.azure.com"
         url = f"{base_url}/openai/responses?api-version={api_version}"
     
-    logging.debug(f"GPT-5 Responses API URL: {url}")
-    logging.debug(f"GPT-5 Request Body: {json.dumps(model_args, indent=2)}")
     
     # Prepare headers
     headers = {
@@ -652,12 +650,6 @@ async def make_responses_api_request(model_args, api_version):
                 return MockChatResponse(response_data)
         
         if response.status_code != 200:
-            # Log the error response details
-            try:
-                error_details = response.json()
-                logging.error(f"GPT-5 API Error Response: {error_details}")
-            except:
-                logging.error(f"GPT-5 API Error (status {response.status_code}): {response.text}")
             response.raise_for_status()
             
         return MockRawResponse(response)
